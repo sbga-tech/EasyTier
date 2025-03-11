@@ -30,6 +30,7 @@ use crate::{
     peers::{
         peer_conn::PeerConn,
         peer_rpc::PeerRpcManagerTransport,
+        recv_packet_from_chan,
         route_trait::{ForeignNetworkRouteInfoMap, NextHopPolicy, RouteInterface},
         PeerPacketFilter,
     },
@@ -43,11 +44,12 @@ use crate::{
     tunnel::{
         self,
         packet_def::{CompressorAlgo, PacketType, ZCPacket},
-        SinkItem, Tunnel, TunnelConnector,
+        Tunnel, TunnelConnector,
     },
 };
 
 use super::{
+    create_packet_recv_chan,
     encrypt::{Encryptor, NullCipher},
     foreign_network_client::ForeignNetworkClient,
     foreign_network_manager::{ForeignNetworkManager, GlobalForeignNetworkAccessor},
@@ -56,7 +58,7 @@ use super::{
     peer_ospf_route::PeerRoute,
     peer_rpc::PeerRpcManager,
     route_trait::{ArcRoute, Route},
-    BoxNicPacketFilter, BoxPeerPacketFilter, PacketRecvChanReceiver,
+    BoxNicPacketFilter, BoxPeerPacketFilter, PacketRecvChan, PacketRecvChanReceiver,
 };
 
 struct RpcTransport {
@@ -116,7 +118,7 @@ pub struct PeerManager {
     my_peer_id: PeerId,
 
     global_ctx: ArcGlobalCtx,
-    nic_channel: mpsc::Sender<SinkItem>,
+    nic_channel: PacketRecvChan,
 
     tasks: Arc<Mutex<JoinSet<()>>>,
 
@@ -155,11 +157,11 @@ impl PeerManager {
     pub fn new(
         route_algo: RouteAlgoType,
         global_ctx: ArcGlobalCtx,
-        nic_channel: mpsc::Sender<SinkItem>,
+        nic_channel: PacketRecvChan,
     ) -> Self {
         let my_peer_id = rand::random();
 
-        let (packet_send, packet_recv) = mpsc::channel(128);
+        let (packet_send, packet_recv) = create_packet_recv_chan();
         let peers = Arc::new(PeerMap::new(
             packet_send.clone(),
             global_ctx.clone(),
@@ -415,9 +417,10 @@ impl PeerManager {
         let foreign_client = self.foreign_network_client.clone();
         let foreign_mgr = self.foreign_network_manager.clone();
         let encryptor = self.encryptor.clone();
+        let compress_algo = self.data_compress_algo;
         self.tasks.lock().await.spawn(async move {
             tracing::trace!("start_peer_recv");
-            while let Some(ret) = recv.recv().await {
+            while let Ok(ret) = recv_packet_from_chan(&mut recv).await {
                 let Err(mut ret) =
                     Self::try_handle_foreign_network_packet(ret, my_peer_id, &peers, &foreign_mgr)
                         .await
@@ -445,6 +448,16 @@ impl PeerManager {
                     }
 
                     hdr.forward_counter += 1;
+
+                    if from_peer_id == my_peer_id
+                        && (hdr.packet_type == PacketType::Data as u8
+                            || hdr.packet_type == PacketType::KcpSrc as u8
+                            || hdr.packet_type == PacketType::KcpDst as u8)
+                    {
+                        let _ = Self::try_compress_and_encrypt(compress_algo, &encryptor, &mut ret)
+                            .await;
+                    }
+
                     tracing::trace!(?to_peer_id, ?my_peer_id, "need forward");
                     let ret =
                         Self::send_msg_internal(&peers, &foreign_client, ret, to_peer_id).await;
@@ -505,7 +518,7 @@ impl PeerManager {
     async fn init_packet_process_pipeline(&self) {
         // for tun/tap ip/eth packet.
         struct NicPacketProcessor {
-            nic_channel: mpsc::Sender<SinkItem>,
+            nic_channel: PacketRecvChan,
         }
         #[async_trait::async_trait]
         impl PeerPacketFilter for NicPacketProcessor {
@@ -673,7 +686,7 @@ impl PeerManager {
 
     async fn run_nic_packet_process_pipeline(&self, data: &mut ZCPacket) {
         for pipeline in self.nic_packet_process_pipeline.read().await.iter().rev() {
-            pipeline.try_process_packet_from_nic(data).await;
+            let _ = pipeline.try_process_packet_from_nic(data).await;
         }
     }
 
@@ -720,13 +733,7 @@ impl PeerManager {
         }
     }
 
-    pub async fn send_msg_ipv4(&self, mut msg: ZCPacket, ipv4_addr: Ipv4Addr) -> Result<(), Error> {
-        tracing::trace!(
-            "do send_msg in peer manager, msg: {:?}, ipv4_addr: {}",
-            msg,
-            ipv4_addr
-        );
-
+    pub async fn get_msg_dst_peer(&self, ipv4_addr: &Ipv4Addr) -> (Vec<PeerId>, bool) {
         let mut is_exit_node = false;
         let mut dst_peers = vec![];
         let network_length = self
@@ -734,10 +741,10 @@ impl PeerManager {
             .get_ipv4()
             .map(|x| x.network_length())
             .unwrap_or(24);
-        let ipv4_inet = cidr::Ipv4Inet::new(ipv4_addr, network_length).unwrap();
+        let ipv4_inet = cidr::Ipv4Inet::new(*ipv4_addr, network_length).unwrap();
         if ipv4_addr.is_broadcast()
             || ipv4_addr.is_multicast()
-            || ipv4_addr == ipv4_inet.last_address()
+            || *ipv4_addr == ipv4_inet.last_address()
         {
             dst_peers.extend(
                 self.peers
@@ -758,10 +765,29 @@ impl PeerManager {
             }
         }
 
-        if dst_peers.is_empty() {
-            tracing::info!("no peer id for ipv4: {}", ipv4_addr);
-            return Ok(());
-        }
+        (dst_peers, is_exit_node)
+    }
+
+    pub async fn try_compress_and_encrypt(
+        compress_algo: CompressorAlgo,
+        encryptor: &Box<dyn Encryptor>,
+        msg: &mut ZCPacket,
+    ) -> Result<(), Error> {
+        let compressor = DefaultCompressor {};
+        compressor
+            .compress(msg, compress_algo)
+            .await
+            .with_context(|| "compress failed")?;
+        encryptor.encrypt(msg).with_context(|| "encrypt failed")?;
+        Ok(())
+    }
+
+    pub async fn send_msg_ipv4(&self, mut msg: ZCPacket, ipv4_addr: Ipv4Addr) -> Result<(), Error> {
+        tracing::trace!(
+            "do send_msg in peer manager, msg: {:?}, ipv4_addr: {}",
+            msg,
+            ipv4_addr
+        );
 
         msg.fill_peer_manager_hdr(
             self.my_peer_id,
@@ -769,14 +795,25 @@ impl PeerManager {
             tunnel::packet_def::PacketType::Data as u8,
         );
         self.run_nic_packet_process_pipeline(&mut msg).await;
-        let compressor = DefaultCompressor {};
-        compressor
-            .compress(&mut msg, self.data_compress_algo)
-            .await
-            .with_context(|| "compress failed")?;
-        self.encryptor
-            .encrypt(&mut msg)
-            .with_context(|| "encrypt failed")?;
+        let cur_to_peer_id = msg.peer_manager_header().unwrap().to_peer_id.into();
+        if cur_to_peer_id != 0 {
+            return Self::send_msg_internal(
+                &self.peers,
+                &self.foreign_network_client,
+                msg,
+                cur_to_peer_id,
+            )
+            .await;
+        }
+
+        let (dst_peers, is_exit_node) = self.get_msg_dst_peer(&ipv4_addr).await;
+
+        if dst_peers.is_empty() {
+            tracing::info!("no peer id for ipv4: {}", ipv4_addr);
+            return Ok(());
+        }
+
+        Self::try_compress_and_encrypt(self.data_compress_algo, &self.encryptor, &mut msg).await?;
 
         let is_latency_first = self.global_ctx.get_flags().latency_first;
         msg.mut_peer_manager_header()
@@ -875,7 +912,7 @@ impl PeerManager {
         self.global_ctx.clone()
     }
 
-    pub fn get_nic_channel(&self) -> mpsc::Sender<SinkItem> {
+    pub fn get_nic_channel(&self) -> PacketRecvChan {
         self.nic_channel.clone()
     }
 
@@ -935,6 +972,7 @@ mod tests {
         },
         instance::listeners::get_listener_by_url,
         peers::{
+            create_packet_recv_chan,
             peer_manager::RouteAlgoType,
             peer_rpc::tests::register_service,
             route_trait::NextHopPolicy,
@@ -1078,7 +1116,7 @@ mod tests {
     #[tokio::test]
     async fn communicate_between_enc_and_non_enc() {
         let create_mgr = |enable_encryption| async move {
-            let (s, _r) = tokio::sync::mpsc::channel(1000);
+            let (s, _r) = create_packet_recv_chan();
             let mock_global_ctx = get_mock_global_ctx();
             mock_global_ctx.config.set_flags(Flags {
                 enable_encryption,

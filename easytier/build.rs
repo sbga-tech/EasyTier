@@ -128,20 +128,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "windows")]
     WindowsBuild::check_for_win();
 
+    let proto_files_reflect = ["src/proto/peer_rpc.proto", "src/proto/common.proto"];
+
     let proto_files = [
-        "src/proto/peer_rpc.proto",
-        "src/proto/common.proto",
         "src/proto/error.proto",
         "src/proto/tests.proto",
         "src/proto/cli.proto",
         "src/proto/web.proto",
     ];
 
-    for proto_file in &proto_files {
+    for proto_file in proto_files.iter().chain(proto_files_reflect.iter()) {
         println!("cargo:rerun-if-changed={}", proto_file);
     }
 
-    prost_build::Config::new()
+    let mut config = prost_build::Config::new();
+    config
         .protoc_arg("--experimental_allow_proto3_optional")
         .type_attribute(".common", "#[derive(serde::Serialize, serde::Deserialize)]")
         .type_attribute(".error", "#[derive(serde::Serialize, serde::Deserialize)]")
@@ -156,9 +157,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .type_attribute("peer_rpc.ForeignNetworkRouteInfoKey", "#[derive(Hash, Eq)]")
         .type_attribute("common.RpcDescriptor", "#[derive(Hash, Eq)]")
         .service_generator(Box::new(rpc_build::ServiceGenerator::new()))
-        .btree_map(["."])
-        .compile_protos(&proto_files, &["src/proto/"])
-        .unwrap();
+        .btree_map(["."]);
+
+    config.compile_protos(&proto_files, &["src/proto/"])?;
+
+    prost_reflect_build::Builder::new()
+        .file_descriptor_set_bytes("crate::proto::DESCRIPTOR_POOL_BYTES")
+        .compile_protos_with_config(config, &proto_files_reflect, &["src/proto/"])?;
 
     check_locale();
     Ok(())

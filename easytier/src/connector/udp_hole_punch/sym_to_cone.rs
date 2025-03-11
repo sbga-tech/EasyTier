@@ -284,6 +284,7 @@ impl PunchSymToConeHoleClient {
                 BaseController {
                     timeout_ms: 4000,
                     trace_id: 0,
+                    ..Default::default()
                 },
                 req,
             )
@@ -314,6 +315,7 @@ impl PunchSymToConeHoleClient {
                 BaseController {
                     timeout_ms: 4000,
                     trace_id: 0,
+                    ..Default::default()
                 },
                 req,
             )
@@ -529,6 +531,7 @@ pub mod tests {
     };
 
     #[tokio::test]
+    #[serial_test::serial]
     #[serial_test::serial(hole_punch)]
     async fn hole_punching_symmetric_only_random() {
         RUN_TESTING.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -577,13 +580,15 @@ pub mod tests {
         )
         .await;
 
+        println!("start punching {:?}", p_a.list_routes().await);
+
         wait_for_condition(
             || async {
                 wait_route_appear_with_cost(p_a.clone(), p_c.my_peer_id(), Some(1))
                     .await
                     .is_ok()
             },
-            Duration::from_secs(5),
+            Duration::from_secs(10),
         )
         .await;
         println!("{:?}", p_a.list_routes().await);

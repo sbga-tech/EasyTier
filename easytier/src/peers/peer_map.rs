@@ -10,7 +10,7 @@ use crate::{
         global_ctx::{ArcGlobalCtx, GlobalCtxEvent, NetworkIdentity},
         PeerId,
     },
-    proto::cli::PeerConnInfo,
+    proto::{cli::PeerConnInfo, common::PeerFeatureFlag},
     tunnel::{packet_def::ZCPacket, TunnelError},
 };
 
@@ -70,11 +70,17 @@ impl PeerMap {
 
     pub async fn send_msg_directly(&self, msg: ZCPacket, dst_peer_id: PeerId) -> Result<(), Error> {
         if dst_peer_id == self.my_peer_id {
-            return Ok(self
-                .packet_send
-                .send(msg)
-                .await
-                .with_context(|| "send msg to self failed")?);
+            let packet_send = self.packet_send.clone();
+            tokio::spawn(async move {
+                let ret = packet_send
+                    .send(msg)
+                    .await
+                    .with_context(|| "send msg to self failed");
+                if ret.is_err() {
+                    tracing::error!("send msg to self failed: {:?}", ret);
+                }
+            });
+            return Ok(());
         }
 
         match self.get_peer_by_id(dst_peer_id) {
@@ -157,6 +163,16 @@ impl PeerMap {
             if peer_id.is_some() {
                 return peer_id;
             }
+        }
+        None
+    }
+
+    pub async fn get_peer_feature_flag(&self, peer_id: PeerId) -> Option<PeerFeatureFlag> {
+        for route in self.routes.read().await.iter() {
+            let feature_flag = route.get_feature_flag(peer_id).await;
+            if feature_flag.is_some() {
+                return feature_flag;
+            };
         }
         None
     }

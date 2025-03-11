@@ -21,6 +21,15 @@ message FlagsInConfig {
   string ipv6_listener = 14;
   bool multi_thread = 15;
   CompressionAlgoPb data_compress_algo = 16;
+  bool bind_device = 17;
+
+  // should we convert all tcp streams into kcp streams
+  bool enable_kcp_proxy = 18;
+  // does this peer allow kcp input
+  bool disable_kcp_input = 19;
+  // allow relay kcp packets (for public server, this can reduce the throughput)
+  bool disable_relay_kcp = 20;
+  bool proxy_forward_by_system = 21;
 }
 
 message RpcDescriptor {
@@ -143,4 +152,6 @@ message StunInfo {
 message PeerFeatureFlag {
   bool is_public_server = 1;
   bool avoid_relay_data = 2;
+  bool kcp_input = 3;
+  bool no_relay_kcp  = 4;
 }

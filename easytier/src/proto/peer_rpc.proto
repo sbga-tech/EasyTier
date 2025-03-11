@@ -205,3 +205,8 @@ message HandshakeRequest {
   string network_name = 5;
   bytes network_secret_digrest = 6;
 }
+
+message KcpConnData {
+  common.SocketAddr src = 1;
+  common.SocketAddr dst = 4;
+}

@@ -6,6 +6,7 @@ extern crate rust_i18n;
 use std::{
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
+    sync::Arc,
 };
 
 use anyhow::Context;
@@ -19,12 +20,17 @@ use easytier::{
             TomlConfigLoader, VpnPortalConfig,
         },
         constants::EASYTIER_VERSION,
-        global_ctx::{EventBusSubscriber, GlobalCtxEvent},
+        global_ctx::{EventBusSubscriber, GlobalCtx, GlobalCtxEvent},
         scoped_task::ScopedTask,
+        stun::MockStunInfoCollector,
     },
+    connector::{create_connector_by_url, dns_connector::DNSTunnelConnector},
     launcher,
-    proto::{self, common::CompressionAlgoPb},
-    tunnel::udp::UdpTunnelConnector,
+    proto::{
+        self,
+        common::{CompressionAlgoPb, NatType},
+    },
+    tunnel::PROTO_PORT_OFFSET,
     utils::{init_logger, setup_panic_handler},
     web_client,
 };
@@ -125,6 +131,13 @@ struct Cli {
 
     #[arg(
         long,
+        help = t!("core_clap.mapped_listeners").to_string(),
+        num_args = 0..
+    )]
+    mapped_listeners: Vec<String>,
+
+    #[arg(
+        long,
         help = t!("core_clap.no_listener").to_string(),
         default_value = "false"
     )]
@@ -185,7 +198,7 @@ struct Cli {
     #[arg(
         long,
         help = t!("core_clap.multi_thread").to_string(),
-        default_value = "false"
+        default_value = "true"
     )]
     multi_thread: bool,
 
@@ -228,6 +241,13 @@ struct Cli {
         default_value = "false"
     )]
     enable_exit_node: bool,
+
+    #[arg(
+        long,
+        help = t!("core_clap.proxy_forward_by_system").to_string(),
+        default_value = "false"
+    )]
+    proxy_forward_by_system: bool,
 
     #[arg(
         long,
@@ -300,14 +320,32 @@ struct Cli {
         default_value = "none",
     )]
     compression: String,
+
+    #[arg(
+        long,
+        help = t!("core_clap.bind_device").to_string()
+    )]
+    bind_device: Option<bool>,
+
+    #[arg(
+        long,
+        help = t!("core_clap.enable_kcp_proxy").to_string(),
+        default_value = "false"
+    )]
+    enable_kcp_proxy: bool,
+
+    #[arg(
+        long,
+        help = t!("core_clap.disable_kcp_input").to_string(),
+        default_value = "false"
+    )]
+    disable_kcp_input: bool,
 }
 
 rust_i18n::i18n!("locales", fallback = "en");
 
 impl Cli {
     fn parse_listeners(no_listener: bool, listeners: Vec<String>) -> anyhow::Result<Vec<String>> {
-        let proto_port_offset = vec![("tcp", 0), ("udp", 0), ("wg", 1), ("ws", 1), ("wss", 2)];
-
         if no_listener || listeners.is_empty() {
             return Ok(vec![]);
         }
@@ -316,8 +354,8 @@ impl Cli {
         let mut listeners: Vec<String> = Vec::new();
         if origin_listners.len() == 1 {
             if let Ok(port) = origin_listners[0].parse::<u16>() {
-                for (proto, offset) in proto_port_offset {
-                    listeners.push(format!("{}://0.0.0.0:{}", proto, port + offset));
+                for (proto, offset) in PROTO_PORT_OFFSET {
+                    listeners.push(format!("{}://0.0.0.0:{}", proto, port + *offset));
                 }
                 return Ok(listeners);
             }
@@ -332,7 +370,7 @@ impl Cli {
                     panic!("failed to parse listener: {}", l);
                 }
             } else {
-                let Some((proto, offset)) = proto_port_offset
+                let Some((proto, offset)) = PROTO_PORT_OFFSET
                     .iter()
                     .find(|(proto, _)| *proto == proto_port[0])
                 else {
@@ -421,6 +459,23 @@ impl TryFrom<&Cli> for TomlConfigLoader {
                 .map(|s| s.parse().unwrap())
                 .collect(),
         );
+
+        cfg.set_mapped_listeners(Some(
+            cli.mapped_listeners
+                .iter()
+                .map(|s| {
+                    s.parse()
+                        .with_context(|| format!("mapped listener is not a valid url: {}", s))
+                        .unwrap()
+                })
+                .map(|s: url::Url| {
+                    if s.port().is_none() {
+                        panic!("mapped listener port is missing: {}", s);
+                    }
+                    s
+                })
+                .collect(),
+        ));
 
         for n in cli.proxy_networks.iter() {
             cfg.add_proxy_cidr(
@@ -512,12 +567,14 @@ impl TryFrom<&Cli> for TomlConfigLoader {
             f.mtu = mtu as u32;
         }
         f.enable_exit_node = cli.enable_exit_node;
+        f.proxy_forward_by_system = cli.proxy_forward_by_system;
         f.no_tun = cli.no_tun || cfg!(not(feature = "tun"));
         f.use_smoltcp = cli.use_smoltcp;
         if let Some(wl) = cli.relay_network_whitelist.as_ref() {
             f.relay_network_whitelist = wl.join(" ");
         }
         f.disable_p2p = cli.disable_p2p;
+        f.disable_udp_hole_punching = cli.disable_udp_hole_punching;
         f.relay_all_peer_rpc = cli.relay_all_peer_rpc;
         if let Some(ipv6_listener) = cli.ipv6_listener.as_ref() {
             f.ipv6_listener = ipv6_listener
@@ -534,6 +591,11 @@ impl TryFrom<&Cli> for TomlConfigLoader {
             ),
         }
         .into();
+        if let Some(bind_device) = cli.bind_device {
+            f.bind_device = bind_device;
+        }
+        f.enable_kcp_proxy = cli.enable_kcp_proxy;
+        f.disable_kcp_input = cli.disable_kcp_input;
         cfg.set_flags(f);
 
         cfg.set_exit_nodes(cli.exit_nodes.clone());
@@ -810,8 +872,20 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
             panic!("empty token");
         }
 
-        let _wc = web_client::WebClient::new(UdpTunnelConnector::new(c_url), token.to_string());
+        let config = TomlConfigLoader::default();
+        let global_ctx = Arc::new(GlobalCtx::new(config));
+        global_ctx.replace_stun_info_collector(Box::new(MockStunInfoCollector {
+            udp_nat_type: NatType::Unknown,
+        }));
+        let mut flags = global_ctx.get_flags();
+        flags.bind_device = false;
+        global_ctx.set_flags(flags);
+        let _wc = web_client::WebClient::new(
+            create_connector_by_url(c_url.as_str(), &global_ctx).await?,
+            token.to_string(),
+        );
         tokio::signal::ctrl_c().await.unwrap();
+        DNSTunnelConnector::new("".parse().unwrap(), global_ctx);
         return Ok(());
     }
 

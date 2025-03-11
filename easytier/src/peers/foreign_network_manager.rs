@@ -24,6 +24,7 @@ use crate::{
         config::{ConfigLoader, TomlConfigLoader},
         error::Error,
         global_ctx::{ArcGlobalCtx, GlobalCtx, GlobalCtxEvent, NetworkIdentity},
+        join_joinset_background,
         stun::MockStunInfoCollector,
         PeerId,
     },
@@ -37,11 +38,13 @@ use crate::{
 };
 
 use super::{
+    create_packet_recv_chan,
     peer_conn::PeerConn,
     peer_map::PeerMap,
     peer_ospf_route::PeerRoute,
     peer_rpc::{PeerRpcManager, PeerRpcManagerTransport},
     peer_rpc_service::DirectConnectorManagerRpcServer,
+    recv_packet_from_chan,
     route_trait::NextHopPolicy,
     PacketRecvChan, PacketRecvChanReceiver,
 };
@@ -79,7 +82,7 @@ impl ForeignNetworkEntry {
     ) -> Self {
         let foreign_global_ctx = Self::build_foreign_global_ctx(&network, global_ctx.clone());
 
-        let (packet_sender, packet_recv) = mpsc::channel(64);
+        let (packet_sender, packet_recv) = create_packet_recv_chan();
 
         let peer_map = Arc::new(PeerMap::new(
             packet_sender,
@@ -179,6 +182,15 @@ impl ForeignNetworkEntry {
             }
         }
 
+        impl Drop for RpcTransport {
+            fn drop(&mut self) {
+                tracing::debug!(
+                    "drop rpc transport for foreign network manager, my_peer_id: {:?}",
+                    self.my_peer_id
+                );
+            }
+        }
+
         let (rpc_transport_sender, peer_rpc_tspt_recv) = mpsc::unbounded_channel();
         let tspt = RpcTransport {
             my_peer_id,
@@ -214,7 +226,6 @@ impl ForeignNetworkEntry {
                     .list_global_foreign_peer(&self.network_identity)
                     .await;
                 let local = peer_map.list_peers_with_conn().await;
-                tracing::debug!(?global, ?local, ?self.my_peer_id, "list peers in foreign network manager");
                 global.extend(local.iter().cloned());
                 global
                     .into_iter()
@@ -251,7 +262,7 @@ impl ForeignNetworkEntry {
         let network_name = self.network.network_name.clone();
 
         self.tasks.lock().await.spawn(async move {
-            while let Some(zc_packet) = recv.recv().await {
+            while let Ok(zc_packet) = recv_packet_from_chan(&mut recv).await {
                 let Some(hdr) = zc_packet.peer_manager_header() else {
                     tracing::warn!("invalid packet, skip");
                     continue;
@@ -424,7 +435,7 @@ pub struct ForeignNetworkManager {
 
     data: Arc<ForeignNetworkManagerData>,
 
-    tasks: Mutex<JoinSet<()>>,
+    tasks: Arc<std::sync::Mutex<JoinSet<()>>>,
 }
 
 impl ForeignNetworkManager {
@@ -442,6 +453,9 @@ impl ForeignNetworkManager {
             lock: std::sync::Mutex::new(()),
         });
 
+        let tasks = Arc::new(std::sync::Mutex::new(JoinSet::new()));
+        join_joinset_background(tasks.clone(), "ForeignNetworkManager".to_string());
+
         Self {
             my_peer_id,
             global_ctx,
@@ -449,7 +463,7 @@ impl ForeignNetworkManager {
 
             data,
 
-            tasks: Mutex::new(JoinSet::new()),
+            tasks,
         }
     }
 
@@ -501,7 +515,7 @@ impl ForeignNetworkManager {
         let data = self.data.clone();
         let network_name = entry.network.network_name.clone();
         let mut s = entry.global_ctx.subscribe();
-        self.tasks.lock().await.spawn(async move {
+        self.tasks.lock().unwrap().spawn(async move {
             while let Ok(e) = s.recv().await {
                 match &e {
                     GlobalCtxEvent::PeerRemoved(peer_id) => {
@@ -622,7 +636,7 @@ mod tests {
         network: &str,
         secret: &str,
     ) -> Arc<PeerManager> {
-        let (s, _r) = tokio::sync::mpsc::channel(1000);
+        let (s, _r) = create_packet_recv_chan();
         let peer_mgr = Arc::new(PeerManager::new(
             RouteAlgoType::Ospf,
             get_mock_global_ctx_with_network(Some(NetworkIdentity::new(

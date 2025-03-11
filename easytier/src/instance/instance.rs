@@ -17,13 +17,14 @@ use crate::connector::direct::DirectConnectorManager;
 use crate::connector::manual::{ConnectorManagerRpcService, ManualConnectorManager};
 use crate::connector::udp_hole_punch::UdpHolePunchConnector;
 use crate::gateway::icmp_proxy::IcmpProxy;
-use crate::gateway::tcp_proxy::TcpProxy;
+use crate::gateway::kcp_proxy::{KcpProxyDst, KcpProxyDstRpcService, KcpProxySrc};
+use crate::gateway::tcp_proxy::{NatDstTcpConnector, TcpProxy, TcpProxyRpcService};
 use crate::gateway::udp_proxy::UdpProxy;
 use crate::peer_center::instance::PeerCenterInstance;
 use crate::peers::peer_conn::PeerConnId;
 use crate::peers::peer_manager::{PeerManager, RouteAlgoType};
 use crate::peers::rpc_service::PeerManagerRpcService;
-use crate::peers::PacketRecvChanReceiver;
+use crate::peers::{create_packet_recv_chan, recv_packet_from_chan, PacketRecvChanReceiver};
 use crate::proto::cli::VpnPortalRpc;
 use crate::proto::cli::{GetVpnPortalInfoRequest, GetVpnPortalInfoResponse, VpnPortalInfo};
 use crate::proto::peer_rpc::PeerCenterRpcServer;
@@ -40,7 +41,7 @@ use crate::gateway::socks5::Socks5Server;
 
 #[derive(Clone)]
 struct IpProxy {
-    tcp_proxy: Arc<TcpProxy>,
+    tcp_proxy: Arc<TcpProxy<NatDstTcpConnector>>,
     icmp_proxy: Arc<IcmpProxy>,
     udp_proxy: Arc<UdpProxy>,
     global_ctx: ArcGlobalCtx,
@@ -49,7 +50,7 @@ struct IpProxy {
 
 impl IpProxy {
     fn new(global_ctx: ArcGlobalCtx, peer_manager: Arc<PeerManager>) -> Result<Self, Error> {
-        let tcp_proxy = TcpProxy::new(global_ctx.clone(), peer_manager.clone());
+        let tcp_proxy = TcpProxy::new(peer_manager.clone(), NatDstTcpConnector {});
         let icmp_proxy = IcmpProxy::new(global_ctx.clone(), peer_manager.clone())
             .with_context(|| "create icmp proxy failed")?;
         let udp_proxy = UdpProxy::new(global_ctx.clone(), peer_manager.clone())
@@ -64,7 +65,9 @@ impl IpProxy {
     }
 
     async fn start(&self) -> Result<(), Error> {
-        if (self.global_ctx.get_proxy_cidrs().is_empty() || self.started.load(Ordering::Relaxed))
+        if (self.global_ctx.get_proxy_cidrs().is_empty()
+            || self.global_ctx.proxy_forward_by_system()
+            || self.started.load(Ordering::Relaxed))
             && !self.global_ctx.enable_exit_node()
             && !self.global_ctx.no_tun()
         {
@@ -72,7 +75,7 @@ impl IpProxy {
         }
 
         self.started.store(true, Ordering::Relaxed);
-        self.tcp_proxy.start().await?;
+        self.tcp_proxy.start(true).await?;
         self.icmp_proxy.start().await?;
         self.udp_proxy.start().await?;
         Ok(())
@@ -116,6 +119,9 @@ pub struct Instance {
 
     ip_proxy: Option<IpProxy>,
 
+    kcp_proxy_src: Option<KcpProxySrc>,
+    kcp_proxy_dst: Option<KcpProxyDst>,
+
     peer_center: Arc<PeerCenterInstance>,
 
     vpn_portal: Arc<Mutex<Box<dyn VpnPortal>>>,
@@ -137,7 +143,7 @@ impl Instance {
             global_ctx.config.dump()
         );
 
-        let (peer_packet_sender, peer_packet_receiver) = tokio::sync::mpsc::channel(100);
+        let (peer_packet_sender, peer_packet_receiver) = create_packet_recv_chan();
 
         let id = global_ctx.get_id();
 
@@ -193,6 +199,8 @@ impl Instance {
             udp_hole_puncher: Arc::new(Mutex::new(udp_hole_puncher)),
 
             ip_proxy: None,
+            kcp_proxy_src: None,
+            kcp_proxy_dst: None,
 
             peer_center,
 
@@ -230,7 +238,7 @@ impl Instance {
         let mut tasks = JoinSet::new();
         tasks.spawn(async move {
             let mut packet_recv = packet_recv.lock().await;
-            while let Some(packet) = packet_recv.recv().await {
+            while let Ok(packet) = recv_packet_from_chan(&mut packet_recv).await {
                 tracing::trace!("packet consumed by mock nic ctx: {:?}", packet);
             }
         });
@@ -374,7 +382,17 @@ impl Instance {
             self.check_dhcp_ip_conflict();
         }
 
-        self.run_rpc_server().await?;
+        if self.global_ctx.get_flags().enable_kcp_proxy {
+            let src_proxy = KcpProxySrc::new(self.get_peer_manager()).await;
+            src_proxy.start().await;
+            self.kcp_proxy_src = Some(src_proxy);
+        }
+
+        if !self.global_ctx.get_flags().disable_kcp_input {
+            let mut dst_proxy = KcpProxyDst::new(self.get_peer_manager()).await;
+            dst_proxy.start().await;
+            self.kcp_proxy_dst = Some(dst_proxy);
+        }
 
         // run after tun device created, so listener can bind to tun device, which may be required by win 10
         self.ip_proxy = Some(IpProxy::new(
@@ -400,6 +418,8 @@ impl Instance {
 
         #[cfg(feature = "socks5")]
         self.socks5_server.run().await?;
+
+        self.run_rpc_server().await?;
 
         Ok(())
     }
@@ -522,6 +542,26 @@ impl Instance {
             .register(PeerCenterRpcServer::new(peer_center.get_rpc_service()), "");
         s.registry()
             .register(VpnPortalRpcServer::new(vpn_portal_rpc), "");
+
+        if let Some(ip_proxy) = self.ip_proxy.as_ref() {
+            s.registry().register(
+                TcpProxyRpcServer::new(TcpProxyRpcService::new(ip_proxy.tcp_proxy.clone())),
+                "tcp",
+            );
+        }
+        if let Some(kcp_proxy) = self.kcp_proxy_src.as_ref() {
+            s.registry().register(
+                TcpProxyRpcServer::new(TcpProxyRpcService::new(kcp_proxy.get_tcp_proxy())),
+                "kcp_src",
+            );
+        }
+
+        if let Some(kcp_proxy) = self.kcp_proxy_dst.as_ref() {
+            s.registry().register(
+                TcpProxyRpcServer::new(KcpProxyDstRpcService::new(kcp_proxy)),
+                "kcp_dst",
+            );
+        }
 
         let _g = self.global_ctx.net_ns.guard();
         Ok(s.serve().await.with_context(|| "rpc server start failed")?)

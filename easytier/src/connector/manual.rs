@@ -297,12 +297,14 @@ impl ManualConnectorManager {
 
         connector.lock().await.set_ip_version(ip_version);
 
-        set_bind_addr_for_peer_connector(
-            connector.lock().await.as_mut(),
-            ip_version == IpVersion::V4,
-            &ip_collector,
-        )
-        .await;
+        if data.global_ctx.config.get_flags().bind_device {
+            set_bind_addr_for_peer_connector(
+                connector.lock().await.as_mut(),
+                ip_version == IpVersion::V4,
+                &ip_collector,
+            )
+            .await;
+        }
 
         data.global_ctx.issue_event(GlobalCtxEvent::Connecting(
             connector.lock().await.remote_url().clone(),
@@ -337,7 +339,7 @@ impl ManualConnectorManager {
         let mut ip_versions = vec![];
         let u = url::Url::parse(&dead_url)
             .with_context(|| format!("failed to parse connector url {:?}", dead_url))?;
-        if u.scheme() == "ring" {
+        if u.scheme() == "ring" || u.scheme() == "txt" || u.scheme() == "srv" {
             ip_versions.push(IpVersion::Both);
         } else {
             let addrs = u.socket_addrs(|| Some(1000))?;
@@ -363,8 +365,12 @@ impl ManualConnectorManager {
             "cannot get ip from url"
         )));
         for ip_version in ip_versions {
+            let use_long_timeout = dead_url.starts_with("http")
+                || dead_url.starts_with("srv")
+                || dead_url.starts_with("txt");
             let ret = timeout(
-                std::time::Duration::from_secs(1),
+                // allow http connector to wait longer
+                std::time::Duration::from_secs(if use_long_timeout { 20 } else { 2 }),
                 Self::conn_reconnect_with_ip_version(
                     data.clone(),
                     dead_url.clone(),

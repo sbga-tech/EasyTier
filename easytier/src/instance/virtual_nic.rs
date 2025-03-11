@@ -12,7 +12,7 @@ use crate::{
         global_ctx::{ArcGlobalCtx, GlobalCtxEvent},
         ifcfg::{IfConfiger, IfConfiguerTrait},
     },
-    peers::{peer_manager::PeerManager, PacketRecvChanReceiver},
+    peers::{peer_manager::PeerManager, recv_packet_from_chan, PacketRecvChanReceiver},
     tunnel::{
         common::{reserve_buf, FramedWriter, TunnelWrapper, ZCPacketToBytes},
         packet_def::{ZCPacket, ZCPacketType, TAIL_RESERVED_SIZE},
@@ -349,6 +349,15 @@ impl VirtualNic {
         {
             let dev_name = self.global_ctx.get_flags().dev_name;
 
+            match crate::arch::windows::add_self_to_firewall_allowlist() {
+                Ok(_) => tracing::info!("add_self_to_firewall_allowlist successful!"),
+                Err(e) => {
+                    println!("Failed to add Easytier to firewall allowlist, Subnet proxy and KCP proxy may not work properly. error: {}", e);
+                    println!("You can add firewall rules manually, or use --use-smoltcp to run with user-space TCP/IP stack.");
+                    println!("");
+                }
+            }
+
             match checkreg(&dev_name) {
                 Ok(_) => tracing::trace!("delete successful!"),
                 Err(e) => tracing::error!("An error occurred: {}", e),
@@ -617,7 +626,7 @@ impl NicCtx {
         self.tasks.spawn(async move {
             // unlock until coroutine finished
             let mut channel = channel.lock().await;
-            while let Some(packet) = channel.recv().await {
+            while let Ok(packet) = recv_packet_from_chan(&mut channel).await {
                 tracing::trace!(
                     "[USER_PACKET] forward packet from peers to nic. packet: {:?}",
                     packet

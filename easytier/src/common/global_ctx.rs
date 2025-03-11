@@ -68,6 +68,7 @@ pub struct GlobalCtx {
     running_listeners: Mutex<Vec<url::Url>>,
 
     enable_exit_node: bool,
+    proxy_forward_by_system: bool,
     no_tun: bool,
 
     feature_flags: AtomicCell<PeerFeatureFlag>,
@@ -99,7 +100,12 @@ impl GlobalCtx {
         let stun_info_collection = Arc::new(StunInfoCollector::new_with_default_servers());
 
         let enable_exit_node = config_fs.get_flags().enable_exit_node;
+        let proxy_forward_by_system = config_fs.get_flags().proxy_forward_by_system;
         let no_tun = config_fs.get_flags().no_tun;
+
+        let mut feature_flags = PeerFeatureFlag::default();
+        feature_flags.kcp_input = !config_fs.get_flags().disable_kcp_input;
+        feature_flags.no_relay_kcp = config_fs.get_flags().disable_relay_kcp;
 
         GlobalCtx {
             inst_name: config_fs.get_inst_name(),
@@ -121,9 +127,10 @@ impl GlobalCtx {
             running_listeners: Mutex::new(Vec::new()),
 
             enable_exit_node,
+            proxy_forward_by_system,
             no_tun,
 
-            feature_flags: AtomicCell::new(PeerFeatureFlag::default()),
+            feature_flags: AtomicCell::new(feature_flags),
         }
     }
 
@@ -230,7 +237,10 @@ impl GlobalCtx {
     }
 
     pub fn add_running_listener(&self, url: url::Url) {
-        self.running_listeners.lock().unwrap().push(url);
+        let mut l = self.running_listeners.lock().unwrap();
+        if !l.contains(&url) {
+            l.push(url);
+        }
     }
 
     pub fn get_vpn_portal_cidr(&self) -> Option<cidr::Ipv4Cidr> {
@@ -264,6 +274,10 @@ impl GlobalCtx {
 
     pub fn enable_exit_node(&self) -> bool {
         self.enable_exit_node
+    }
+
+    pub fn proxy_forward_by_system(&self) -> bool {
+        self.proxy_forward_by_system
     }
 
     pub fn no_tun(&self) -> bool {

@@ -364,6 +364,9 @@ pub async fn subnet_proxy_three_node_test(
     #[values("tcp", "udp", "wg")] proto: &str,
     #[values(true, false)] no_tun: bool,
     #[values(true, false)] relay_by_public_server: bool,
+    #[values(true, false)] enable_kcp_proxy: bool,
+    #[values(true, false)] disable_kcp_input: bool,
+    #[values(true, false)] dst_enable_kcp_proxy: bool,
 ) {
     let insts = init_three_node_ex(
         proto,
@@ -371,6 +374,8 @@ pub async fn subnet_proxy_three_node_test(
             if cfg.get_inst_name() == "inst3" {
                 let mut flags = cfg.get_flags();
                 flags.no_tun = no_tun;
+                flags.disable_kcp_input = disable_kcp_input;
+                flags.enable_kcp_proxy = dst_enable_kcp_proxy;
                 cfg.set_flags(flags);
                 cfg.add_proxy_cidr("10.1.2.0/24".parse().unwrap());
             }
@@ -380,6 +385,12 @@ pub async fn subnet_proxy_three_node_test(
                     "public".to_string(),
                     "public".to_string(),
                 ));
+            }
+
+            if cfg.get_inst_name() == "inst1" && enable_kcp_proxy {
+                let mut flags = cfg.get_flags();
+                flags.enable_kcp_proxy = true;
+                cfg.set_flags(flags);
             }
 
             cfg
@@ -481,6 +492,11 @@ pub async fn proxy_three_node_disconnect_test(#[values("tcp", "wg")] proto: &str
     }
     inst4.run().await.unwrap();
 
+    tracing::info!("inst1 peer id: {:?}", insts[0].peer_id());
+    tracing::info!("inst2 peer id: {:?}", insts[1].peer_id());
+    tracing::info!("inst3 peer id: {:?}", insts[2].peer_id());
+    tracing::info!("inst4 peer id: {:?}", inst4.peer_id());
+
     let task = tokio::spawn(async move {
         for _ in 1..=2 {
             tokio::time::sleep(tokio::time::Duration::from_secs(8)).await;
@@ -504,6 +520,24 @@ pub async fn proxy_three_node_disconnect_test(#[values("tcp", "wg")] proto: &str
             }));
             wait_for_condition(
                 || async {
+                    insts[2]
+                        .get_peer_manager()
+                        .get_peer_map()
+                        .list_peers_with_conn()
+                        .await
+                        .iter()
+                        .find(|r| **r == inst4.peer_id())
+                        .is_none()
+                },
+                // 0 down, assume last packet is recv in -0.01
+                // [2, 7) send ping
+                // [4, 9) ping fail and close connection
+                Duration::from_secs(11),
+            )
+            .await;
+
+            wait_for_condition(
+                || async {
                     insts[0]
                         .get_peer_manager()
                         .list_routes()
@@ -512,9 +546,10 @@ pub async fn proxy_three_node_disconnect_test(#[values("tcp", "wg")] proto: &str
                         .find(|r| r.peer_id == inst4.peer_id())
                         .is_none()
                 },
-                Duration::from_secs(15),
+                Duration::from_secs(7),
             )
             .await;
+
             set_link_status("net_d", true);
         }
     });
